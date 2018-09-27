@@ -1,8 +1,6 @@
 # mcgregorian1
 
-#Header 1
-
-##Header2
+#Header 1#
 
 Welcome to my bio.
 
