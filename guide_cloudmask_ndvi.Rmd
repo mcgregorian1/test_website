@@ -1,0 +1,240 @@
+---
+title: "QA Bits and Cloud-Mask NDVI"
+author: "Ian McGregor"
+geometry: margin=1in
+output:
+  pdf_document:
+    fig_width: 8
+    fig_height: 8
+    fig_caption: true
+urlcolor: blue
+---
+
+```{r global options, include=FALSE}
+library(knitr)
+opts_chunk$set(eval=TRUE, echo=TRUE, message=FALSE, cache=TRUE, warning=FALSE)
+
+library(RStoolbox)
+library(raster)
+library(rgdal)
+library(satellite)
+```
+
+# Overview
+First done: 24 Sept. 2019
+Updated: 24 Sept. 2019
+
+This small tutorial is for understanding and processing Landsat ARD (analysis-ready data). Specifically, I'm talking about Landsat8. Since I knew little to nothing about using satellite data, this is one of the first things my advisor had me do to get myself familiar.
+
+1. Download an image
+2. Understand the different bands
+3. Interpret the bit-packed QA layer
+4. Compute NDVI and plot
+
+## Data setup
+Get the Landsat8 image from [EarthExplorer](https://earthexplorer.usgs.gov/metadata/14320/LC08_CU_029004_20180928_C01_V01/). This requires a free account to download. The image here is from about western MA from 28 Sept. 2018.
+
+```{r data setup}
+# unzip the file
+# untar("landsat_test3/LC08_CU_028006_20180903_20190614_C01_V01_SR.tar")
+
+# load the files
+fname <- list.files("landsat_test2", pattern = "*.tif$") #file names only
+path <- paste0("landsat_test2/", fname)
+s <- stack(path[5:11])
+
+# rename based on the Landsat8 bands
+names(s) <- c("band1_aerosol", "band2_blue", "band3_green", "band4_red", "band5_NIR", "band6_SWIR1", "band7_SWIR2")
+
+# plot to see what the image looks like
+# the scale refers to the max value
+max(s)
+plotRGB(s, r=2,g=4,b=3, scale=14165, stretch="lin")
+```
+
+# 1. and 2. Satellite imagery
+Landsat and satellite imagery are read into R via raster data. Each raster has [specific bands](https://www.usgs.gov/faqs/what-are-best-landsat-spectral-bands-use-my-research?qt-news_science_products=0#qt-news_science_products) that are dependent on the satellite used. For example, Landsat 4/5 TM has different bands than Landsat 8.
+
+Helpful raster guides include:
+
+- [rspatial tutorial](https://rspatial.org/spatial/8-rastermanip.html)
+- [NEON raster tutorial](https://www.neonscience.org/resources/series/introduction-working-raster-data-r)
+
+# 3. How is satellite data stored?
+Raster images of satellite data have different values assigned to them, which correspond to specific bit values that mean different things. Bits are 16-digit binary codes and **are read from right to left**. An example of this for Landsat8 can be found [here](https://prd-wret.s3-us-west-2.amazonaws.com/assets/palladium/production/atoms/files/LSDS-1873_US_Landsat_ARD_DFCB-v5.pdf), page 15.
+
+In ARD (analysis-ready data), there is a rasterlayer that is called PixelQA, which contains these pixel values. The "value" and "Cumulative Sum" columns can be understood as the minimum and maximum values for that bit length, respectively. For example, a number of 8 bits in length can be represented by pixel values ranging from 256 to 511.
+
+Let's say we have a raster pixel value of 52348, and we want to figure out what that means. First, we have to figure out what bit that value refers to. The easy way to do this is with the `decodeQA` function from RStoolbox.
+
+```{r example of bits and values}
+library(RStoolbox)
+decodeQA(52348) #gives us the bit corresponding to the value
+```
+
+Let's look at that number, reading right to left (see source above for reference).
+
+- Bit 0 = 0 = not fill
+- Bit 1 = 0 = not clear
+- Bit 2 = 1 = water present
+- Bit 3 = 1 = cloud shadow present
+- Bit 4 = 1 = snow present
+- Bit 5 = 1 = cloud present
+- Bit 6-7 = 01 = low cloud confidence (remember, it's "01" even though you're reading right to left)
+- Bit 8-9 = 00 = cirrus confidence not set
+- Bit 10 = 1 = terrain is occluded
+- Bit 11-15 = 1/0/0/1/1 = unused
+
+Great! This tells us that this raster pixel has water, and probably is not covered by cloud. Now we understand the bit, and we know what a cell with 52348 means.
+
+## How to use bit values for a cloud mask
+Scenario: you want to make a cloud mask of a Landsat image in order to get the NDVI, since taking NDVI without a cloud mask would throw off the calculations.
+
+What is a cloud mask? It's another term for assigning NA to all pixels that are cloud. NDVI calculation by default will ignore NAs.
+
+The easiest and fastest way to do this for a full raster is by a lookup table. First, we need to create a table that has all the possible pixel values (2^16).
+```{r lookup setup}
+all_qa_vals <- data.frame(val=0:2^16)
+```
+Cool. Now we need to convert every value from 0-65537 to its corresponding bit.
+
+```{r decodeQA}
+all_qa_vals$mapped_val <- apply(all_qa_vals, 1, decodeQA)
+head(all_qa_vals)
+```
+Sweet! The resulting table has 2 columns, and if you want you can take a moment to compare the bit values with the table from the linked document above, to try interpreting some of the bits on your own.
+
+This all works, but what if you want to start assigning a classification based on cloud cover? With Landsat8, the main digits we care about are the first 6. The output of `decodeQA` is good, but if you wanted to specify a new column to be a 0 if, say, the third bit of our earlier column was a 1, you can't do that with a numerical output.
+
+```{r example}
+as.numeric(decodeQA(52348)) #decodeQA returns only a character
+```
+As with anything in R, there are multiple ways to do this. You could, for example, keep the default output of decodeQA (character) and refer to bit positions by character position. In this case, however, we're going to go the numeric route.
+
+A similar version to decodeQA is the function `intToBits`, which instead of outputting a character or simple number, actually creates a vector of the entire bit.
+```{r sample with intToBits}
+as.numeric(intToBits(52348))
+```
+But wait! Compare this output to the decodeQA output. Notice anything? This output is indeed correct, but it's been reversed in order so now we're reading in the correct order, just in a way that's easier for us.
+
+This makes it *much* easier to refer to a specific bit position. Using the `[[` wrapper, you can now refer to any position as if you were counting them yourself.
+
+```{r sample conditional bits}
+q <- as.numeric(intToBits(52348))
+
+if(q[[3]] == "0") print("no water") else print("yay there's water")
+```
+This is specifically looking at bit 2 ("Water"), where `q[[3]]` is the third element of our bit vector, but is actually bit 2 since the bit positions start counting at 0. It seems unnecessarily confusing.
+
+If this is still confusing, you can also try [this website](https://landsat.usgs.gov/sites/default/files/documents/landsat_QA_tools_userguide.pdf), which I only found after trying to understand this on my own. The caveat for this site is that the bit values don't fully match the Landsat8 data I'm using.
+
+## Create a cloud mask
+The next step is to apply this to our entire table, using a number of conditions. Remember, we're vying to create a cloud mask, and we're attempting to do this from the first 6 digits (bits 0-5). A quick way to do this is to create a new function, then apply this to the table.
+
+```{r function for setting mask values}
+# first, we want to define which pixels we want to keep. Everything else (because they don't meet these conditions) will be converted to NA.
+#to make this work, we want the following conditions:
+#bit0 = 0 (the pixel is not fill)
+#bit1 = 1 (the pixel is clear)
+#bit2 = 0 (the pixel does not have water)
+#bit3 = 0 (the pixel does not have cloud shadow)
+#bit4 = 0 (the pixel does not have snow)
+#bit5 = 0 (the pixel does not have cloud)
+
+#easy way to do this is make a vector IN THE SAME ORDER as the output of intToBits (aka backward)
+bits <- c(0,1,0,0,0,0)
+
+# then make function
+cmsk_fun <- function(x){
+  # needs to deal w/ NA values
+  bitnum <- as.integer(intToBits(x))
+  if(all(bitnum[c(1:6)] == bits)){
+    return(1)
+  }else{
+    return(0)
+  }
+}
+
+all_qa_vals$isbits <- NULL # don't need this column since the function skips it
+all_qa_vals$mapped_val <- apply(all_qa_vals, 1, cmsk_fun)
+
+# add in a row that has a value of NA and a mask value of 0 in case 
+# there are NA values already in the raster
+all_qa_vals <- rbind(all_qa_vals, list(val=NA, mapped_val=0)) 
+
+#convert the 0s to NA for easier translation on the raster
+all_qa_vals$mapped_val <- ifelse(all_qa_vals$mapped_val == 0, NA, all_qa_vals$mapped_val)
+```
+
+Now we want to apply this mask to the raster. With Landsat8, we use the specific PixelQA raster layer, since that is where we got the original pixel values from.
+```{r apply mask}
+library(raster)
+pixQA <- raster(path[2])
+
+# the reclassify function takes the values in the second argument and applies them to the values in the first argument 
+mask_clouds <- reclassify(pixQA, as.matrix(all_qa_vals))
+
+#this plot now shows the image without any pixels that don't match that bit specification from earlier. In other words, now all we have is data without clouds.
+plot(mask_clouds)
+
+#apply this mask to the rasterstack
+s_cmsk <- mask(s, mask=mask_clouds)
+plot(s_cmsk)
+```
+
+Et voila. 
+
+# 4. Calculate NDVI
+Let's take it a step further. Now that we have a cloud mask for the image, we may want to calculate NDVI from the remaining non-cloud land. To do this, we make a function for NDVI (optional) and apply it.
+```{r calculate NDVI}
+#calculate NDVI
+#NDVI is calculated from the red and NIR bands
+## ndvi = (NIR - red) / (NIR + red)
+get_ndvi <- function(ras, NIR_band, red_band){ 
+  NIR <- ras[[NIR_band]] 
+  red <- ras[[red_band]] 
+  get_ndvi <- (NIR-red) / (NIR+red) 
+  return(get_ndvi) 
+}
+s_ndvi <- get_ndvi(s_cmsk, 5, 4)
+plot(s_ndvi)
+```
+Oops. This NDVI plot has odd bounds. I asked my advisor and he replied "There are probably some values that should've been screened, but were missed by the pixel QA. There may also be saturated values." To that effect, he suggested I use a 2% contrast stretch based on the quantiles of the ndvi values.
+
+What does this mean in different terms? 
+
+Essentially a 2% percent contrast stretch is re-defining the color scale. NDVI values should only be between 0 and 1, and most of ours are (see the values of `qs` defined below), so all we need to do is shift the color scale to reflect this.
+
+What does this mean in practice? 
+
+1. You take quantiles of the ndvi (defined here as 0, 2%, 98%, and 100%)
+2. Define the breaks based on them such that you have 256 of them (all colors, but this is purely subjective for plot appearance later)
+3. Define a color palette to use for these breaks
+4. Use a function my advisor came up with that plots the resulting ndvi raster layer with xy coordinates and a legend showing the color scale.
+```{r 2 percent contrast stretch}
+library(viridis)
+qs <- quantile(s_ndvi, c(0, 0.02, 0.98,1))
+r_breaks <- c(qs[1], seq(qs[2], qs[3], len=254), qs[4])
+r_pal <- colorRampPalette(viridis(100))
+
+PlotStretchLegend <- function(r, breaks, pal, ndigits=0, ...){ 
+  # this function assumes that you've applied some sort of LINEAR CONTRAST 
+  # stretch (i.e. 2% stretch). The legend will be WRONG if you applied some 
+  # other nonlinear stretch (e.g. histogram equalization) 
+  
+  plot(r, col=pal(length(breaks) - 1), breaks=breaks, legend=F, ...) 
+  # add a reasonable legend 
+  legend_at <- round(seq(breaks[2], breaks[length(breaks) - 1], len=7), ndigits) 
+  legend_labels <- c(paste("<", legend_at[1]), 
+                     as.character(legend_at[2:(length(legend_at) - 1)]), 
+                     paste(">", legend_at[length(legend_at)])) 
+  plot(raster(matrix(legend_at[1]:legend_at[length(legend_at)])), 
+       legend.only=T, col=pal(length(breaks)-1), 
+       axis.args=list(at=legend_at, labels=legend_labels)) 
+}
+
+PlotStretchLegend(s_ndvi, r_breaks, r_pal)  
+```
+
+Ta-da.
+
